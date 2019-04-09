@@ -20,8 +20,12 @@ def index():
 def index_alt():
     """ Default Module Homepage """
 
-    # Just redirect to list of current cases
-    s3_redirect_default(URL(f="person", vars={"closed": "0"}))
+    from gluon import current
+    if current.auth.s3_has_permission("read", "pr_person", c="br", f="person"):
+        # Just redirect to list of current cases
+        s3_redirect_default(URL(f="person", vars={"closed": "0"}))
+
+    return {"module_name": settings.modules["br"].name_nice}
 
 # =============================================================================
 # Case File and Component Tabs
@@ -30,7 +34,7 @@ def person():
     """ Case File: RESTful CRUD Controller """
 
     # Set the default case status
-    default_status = s3db.br_case_default_status()
+    s3db.br_case_default_status()
 
     # Set contacts-method for tab
     s3db.set_method("pr", "person",
@@ -332,19 +336,29 @@ def person():
                                               filter_opts = (root_org,),
                                               ))
 
-            # TODO when assistance inline and using themes,
-            #      limit selectable themes to case root org
-
-            # Default person_id in inline-measures
+            # Configure inline assistance measures
             if assistance_inline:
                 if record:
                     mtable.person_id.default = record.id
-
+                if settings.get_br_assistance_themes() and root_org:
+                    # Limit selectable themes to the case root org
+                    field = mtable.theme_ids
+                    dbset = s3db.br_org_assistance_themes(root_org)
+                    field.requires = IS_EMPTY_OR(IS_ONE_OF(dbset, "br_assistance_theme.id",
+                                                           field.represent,
+                                                           multiple = True,
+                                                           ))
+                s3db.br_assistance_default_status()
 
         elif r.component_name == "assistance_measure":
 
-            # Default human_resource_id in assistance measures
             mtable = r.component.table
+            ltable = s3db.br_assistance_measure_theme
+
+            # Default status
+            s3db.br_assistance_default_status()
+
+            # Default human_resource_id
             if human_resource_id and settings.get_br_assistance_manager():
                 mtable.human_resource_id.default = human_resource_id
 
@@ -356,6 +370,30 @@ def person():
                     requires = requires.other
                 requires.set_filter(filterby = "person_id",
                                     filter_opts = (record.id,))
+
+            # Represent for br_assistance_measure_theme.id
+            details_per_theme = settings.get_br_assistance_details_per_theme()
+            if details_per_theme:
+                ltable.id.represent = s3db.br_AssistanceMeasureThemeRepresent(
+                                            paragraph = True,
+                                            details = True,
+                                            )
+
+            # Filter theme_id selectors to case root org
+            root_org = s3db.br_case_root_org(r.id)
+            if not root_org:
+                root_org = auth.root_org()
+            if root_org:
+                dbset = s3db.br_org_assistance_themes(root_org)
+                field = mtable.theme_ids
+                field.requires = IS_EMPTY_OR(IS_ONE_OF(dbset, "br_assistance_theme.id",
+                                                       field.represent,
+                                                       multiple = True,
+                                                       ))
+                field = ltable.theme_id
+                field.requires = IS_EMPTY_OR(IS_ONE_OF(dbset, "br_assistance_theme.id",
+                                                       field.represent,
+                                                       ))
 
             # Allow organizer to set an end_date
             if r.method == "organize" and \
@@ -796,6 +834,12 @@ def assistance_status():
     return s3_rest_controller()
 
 # -----------------------------------------------------------------------------
+def assistance_theme():
+    """ Assistance Themes: RESTful CRUD controller """
+
+    return s3_rest_controller()
+
+# -----------------------------------------------------------------------------
 def assistance_type():
     """ Types of Assistance: RESTful CRUD controller """
 
@@ -809,6 +853,9 @@ def assistance_measure():
 
         resource = r.resource
         table = resource.table
+
+        # Set default status
+        s3db.br_assistance_default_status()
 
         # Populate human_resource_id with current user, don't link
         human_resource_id = auth.s3_logged_in_human_resource()
@@ -845,6 +892,9 @@ def assistance_measure():
 
         if not r.component:
 
+            record = r.record
+            ltable = s3db.br_assistance_measure_theme
+
             # Show person_id as link to case file, not writable in this perspective
             field = table.person_id
             field.writable = False
@@ -852,7 +902,6 @@ def assistance_measure():
                 field.represent = s3db.pr_PersonRepresent(show_link=True)
 
             # Filter case_activity_id selector to current case
-            record = r.record
             field = table.case_activity_id
             if record and field.writable:
                 requires = field.requires
@@ -861,10 +910,28 @@ def assistance_measure():
                 requires.set_filter(filterby = "person_id",
                                     filter_opts = (record.person_id,))
 
+            # Filter theme_ids selector to case root org
+            if record and field.writable:
+                root_org = s3db.br_case_root_org(record.person_id)
+                if not root_org:
+                    root_org = auth.root_org()
+                if root_org:
+                    dbset = s3db.br_org_assistance_themes(root_org)
+                    field = table.theme_ids
+                    field.requires = IS_EMPTY_OR(IS_ONE_OF(dbset, "br_assistance_theme.id",
+                                                           field.represent,
+                                                           multiple = True,
+                                                           ))
+                    field = ltable.theme_id
+                    field.requires = IS_EMPTY_OR(IS_ONE_OF(dbset, "br_assistance_theme.id",
+                                                           field.represent,
+                                                           ))
+
             # Adapt list fields to perspective
             list_fields = [(T("ID"), "person_id$pe_label"),
                            "person_id",
                            #"assistance_type_id"|"comments",
+                           #"theme_ids"|measure-theme-links,
                            #"human_resource_id",
                            "start_date",
                            #"hours",
@@ -875,11 +942,28 @@ def assistance_measure():
             if not mine and settings.get_br_assistance_manager():
                 list_fields.insert(2, "human_resource_id")
 
+            use_themes = settings.get_br_assistance_themes()
+            details_per_theme = settings.get_br_assistance_details_per_theme()
+
+            # Include comments if not per-theme
+            if not use_themes or not details_per_theme:
+                list_fields.insert(2, "comments")
+
+            # Include themes if using themes
+            if use_themes:
+                if details_per_theme:
+                    ltable.id.represent = s3db.br_AssistanceMeasureThemeRepresent(
+                                                    paragraph = True,
+                                                    details = True,
+                                                    )
+
+                    list_fields.insert(2, (T("Themes"), "assistance_measure_theme.id"))
+                else:
+                    list_fields.insert(2, "theme_ids")
+
             # Include type when using types, otherwise show details
             if settings.get_br_assistance_types():
                 list_fields.insert(2, "assistance_type_id")
-            else:
-                list_fields.insert(2, "comments")
 
             # Show effort when tracking effort
             if settings.get_br_assistance_track_effort():
